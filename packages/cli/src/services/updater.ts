@@ -11,7 +11,7 @@ import { RetainedImage } from "./retained-image"
 import { action, parseReleaseVersion, type Policy } from "./updater-action"
 import { errorMessage } from "../util/error"
 
-export const methods = ["curl", "npm", "pnpm", "bun", "yarn", "vp", "brew"] as const
+export const methods = ["curl", "npm", "pnpm", "bun", "yarn", "vp", "brew", "winget"] as const
 
 export type Method = (typeof methods)[number]
 export type RunResult = { readonly type: "available" | "installed"; readonly version: string }
@@ -44,6 +44,9 @@ export class UpgradeError extends Error {
 const decodeVpPackages = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Array(Schema.Struct({ name: Schema.String }))),
 )
+const decodeManifestVersion = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ version: Schema.String })),
+)
 
 const installNames: Record<Method, string> = {
   curl: "The OpenCode installer",
@@ -53,7 +56,19 @@ const installNames: Record<Method, string> = {
   yarn: "Yarn",
   vp: "Vite+",
   brew: "Homebrew",
+  winget: "WinGet",
 }
+
+const wingetPackage = "Anomaly.OpenCode"
+const wingetArgs = [
+  "--id",
+  wingetPackage,
+  "--exact",
+  "--source",
+  "winget",
+  "--accept-source-agreements",
+  "--disable-interactivity",
+]
 
 function conciseDetail(input: string) {
   const lines = stripVTControlCharacters(input)
@@ -98,6 +113,8 @@ export interface Interface {
   readonly check: () => Effect.Effect<CheckResult | undefined, Error>
   readonly apply: (version: string) => Effect.Effect<void, Error>
   readonly method: () => Effect.Effect<Method | undefined>
+  /** Explains how to update a copy that Volta or mise manages, which `method` leaves undetected. */
+  readonly managed: (version?: string) => Effect.Effect<UpgradeError | undefined, Error>
   readonly latest: (method?: Method) => Effect.Effect<string, Error>
   readonly upgrade: (method: Method, version: string) => Effect.Effect<void, Error>
   readonly removal: (
@@ -146,6 +163,37 @@ const make = Effect.gen(function* () {
   const installedFormula = ["opencode", "opencode-beta", "opencode-v2"].find((name) =>
     executable.includes(`${path.sep}Cellar${path.sep}${name}${path.sep}`),
   )
+  // WinGet extracts portable packages into a directory named after the package identifier.
+  const installedWinget = /[\\/]winget[\\/]packages[\\/]anomaly\.opencode_/i.test(executable)
+  // Volta packages (tools/image/packages) and mise's npm backend (installs/npm-<name>) keep their own record of the
+  // installed version, so updating the copy in place would leave it stale. npm globals under a Volta or mise Node
+  // (tools/image/node, installs/node) are ordinary npm installs.
+  const installedOwner = !installedPackage
+    ? undefined
+    : /[\\/]tools[\\/]image[\\/]packages[\\/]/.test(executable)
+      ? { name: "Volta", command: "volta install " }
+      : /[\\/]installs[\\/]npm-[^\\/]+[\\/]/.test(executable)
+        ? { name: "mise", command: "mise use -g npm:" }
+        : undefined
+  // npm keeps global packages in <prefix>/lib/node_modules on POSIX. The npm on PATH may belong to another Node
+  // install (fnm, nvm, mise) or prefix, so target the prefix that owns the running binary. Windows uses
+  // <prefix>\node_modules, which Bun and pnpm global installs share, so it keeps the npm on PATH.
+  const packageDirectory = path.dirname(path.dirname(executable))
+  const npmPackageDirectory = installedPackage ? path.join("/lib/node_modules", installedPackage) : undefined
+  const npmPrefix =
+    npmPackageDirectory &&
+    !installedOwner &&
+    process.platform !== "win32" &&
+    packageDirectory.endsWith(npmPackageDirectory)
+      ? packageDirectory.slice(0, -npmPackageDirectory.length) || undefined
+      : undefined
+  const npmPrefixArgs = npmPrefix ? ["--prefix", npmPrefix] : []
+  const npmBin = npmPrefix ? path.join(npmPrefix, "bin") : undefined
+  const prefixNpm =
+    npmBin && (yield* fs.exists(path.join(npmBin, "npm")).pipe(Effect.orElseSucceed(() => false)))
+      ? path.join(npmBin, "npm")
+      : undefined
+  const npm = prefixNpm ?? "npm"
 
   const readPolicy = Effect.fnUntraced(function* () {
     const values = yield* Effect.forEach(["config.json", "opencode.json", "opencode.jsonc"], (name) =>
@@ -157,9 +205,15 @@ const make = Effect.gen(function* () {
     return values.findLast((value) => value !== undefined) ?? "notify"
   })
 
-  const exec = Effect.fnUntraced(function* (command: string[], timeout: Duration.Input = "10 seconds") {
+  const exec = Effect.fnUntraced(function* (command: string[], timeout: Duration.Input = "30 seconds") {
+    // The prefix's npm and the package's postinstall run `node` from PATH, which may be missing or belong to another
+    // Node install, so put the prefix's own node first.
+    const options =
+      command[0] === prefixNpm
+        ? { env: { PATH: [npmBin, process.env.PATH].filter(Boolean).join(path.delimiter) }, extendEnv: true }
+        : undefined
     return yield* appProcess
-      .run(ChildProcess.make(command[0], command.slice(1)), {
+      .run(ChildProcess.make(command[0], command.slice(1), options), {
         timeout,
         maxOutputBytes: 100_000,
         maxErrorBytes: 100_000,
@@ -173,12 +227,13 @@ const make = Effect.gen(function* () {
       )
   })
 
-  const curlBinary = path.resolve(
+  const curlPath = path.resolve(
     global.home,
     ".opencode",
     "bin",
     process.platform === "win32" ? "opencode.exe" : "opencode",
   )
+  const curlBinary = yield* fs.realPath(curlPath).pipe(Effect.orElseSucceed(() => curlPath))
 
   // On Windows a bare `bash` may be the WSL launcher, which cannot run the installer against Windows paths.
   const installerBash = Effect.fnUntraced(function* () {
@@ -197,17 +252,20 @@ const make = Effect.gen(function* () {
   })
 
   const method = Effect.fnUntraced(function* () {
-    if (path.resolve(process.execPath) === curlBinary) return "curl"
+    if (executable === curlBinary) return "curl"
     if (installedFormula) return "brew"
-    if (!installedPackage) return
+    if (installedWinget) return "winget"
+    if (!installedPackage || installedOwner) return
 
-    const checks: ReadonlyArray<{ method: Method; command: string[] }> = [
-      { method: "npm", command: ["npm", "list", "-g", "--depth=0", installedPackage] },
+    const parts = executable.toLowerCase().split(path.sep).map((part) => part.replace(/^\./, ""))
+    const checks: Array<{ method: Method; command: string[] }> = [
+      { method: "npm", command: [npm, "list", "-g", "--depth=0", ...npmPrefixArgs, installedPackage] },
       { method: "pnpm", command: ["pnpm", "list", "-g", "--depth=0", installedPackage] },
       { method: "bun", command: ["bun", "pm", "ls", "-g"] },
       { method: "yarn", command: ["yarn", "global", "list"] },
       { method: "vp", command: ["vp", "list", "-g", "--json", installedPackage] },
     ]
+    checks.sort((a, b) => Number(parts.includes(b.method)) - Number(parts.includes(a.method)))
     const results = yield* Effect.forEach(
       checks,
       (check) =>
@@ -226,16 +284,22 @@ const make = Effect.gen(function* () {
     })?.check.method
   })
 
-  const removal = (method: Method) => {
+  const removalCommand = (method: Method) => {
+    if (method === "winget") return ["winget", "uninstall", ...wingetArgs]
     if (method === "curl" || method === "brew" || !installedPackage) return undefined
     const commands = {
-      npm: ["npm", "uninstall", "--global", installedPackage],
+      npm: [npm, "uninstall", "--global", ...npmPrefixArgs, installedPackage],
       pnpm: ["pnpm", "remove", "--global", installedPackage],
       bun: ["bun", "remove", "--global", installedPackage],
       yarn: ["yarn", "global", "remove", installedPackage],
       vp: ["vp", "uninstall", "-g", installedPackage],
     }
-    const command = commands[method]
+    return commands[method]
+  }
+
+  const removal = (method: Method) => {
+    const command = removalCommand(method)
+    if (!command) return undefined
     return {
       command,
       run: retaining(
@@ -306,11 +370,58 @@ const make = Effect.gen(function* () {
     return { package: packageName, version }
   })
 
+  // WinGet moderates every submission, so only its own index knows which release it can install.
+  const wingetVersion = Effect.fnUntraced(function* () {
+    const failure = (detail: string, cause?: unknown) =>
+      new UpgradeError(
+        {
+          title: "Could not check for OpenCode updates",
+          detail,
+          command: ["winget", "search", ...wingetArgs].join(" "),
+          retry: "Fix the issue above, then run opencode upgrade again.",
+        },
+        cause === undefined ? undefined : { cause },
+      )
+    const result = yield* exec(["winget", "search", ...wingetArgs], "1 minute").pipe(
+      Effect.mapError((cause) => failure(errorDetail(cause), cause)),
+    )
+    // Column headers are localized, but the result row always lists the identifier followed by the version.
+    const version = result.stdout
+      .split(/\r?\n|\r/)
+      .map((line) => line.trim().split(/\s+/))
+      .flatMap((tokens) => {
+        const index = tokens.findIndex((token) => token.toLowerCase() === wingetPackage.toLowerCase())
+        return index === -1 ? [] : tokens.slice(index + 1, index + 2)
+      })
+      .find((token) => parseReleaseVersion(token))
+    if (result.code !== 0 || !version) return yield* Effect.fail(failure(resultDetail(result)))
+    return version
+  })
+
   const latest = (selected?: Method) =>
     (selected ? Effect.succeed(selected) : method()).pipe(
-      Effect.flatMap(release),
-      Effect.map((data) => data.version),
+      Effect.flatMap((method) =>
+        method === "winget" ? wingetVersion() : release(method).pipe(Effect.map((data) => data.version)),
+      ),
     )
+
+  const managedError = (owner: { name: string; command: string }, target: string) =>
+    new UpgradeError({
+      title: `OpenCode is managed by ${owner.name}`,
+      detail: `This copy was installed with ${owner.name}, which keeps its own record of the installed version, so OpenCode won't update it directly.`,
+      command: `${owner.command}${target}`,
+      retry: "Run the command above, then restart OpenCode.",
+    })
+
+  const managedMessage = (error: UpgradeError) => `${error.title}. Update it with ${error.command}`
+
+  const managed = Effect.fnUntraced(function* (input?: string) {
+    if (!installedOwner) return
+    if (input !== undefined && !parseReleaseVersion(input))
+      return yield* Effect.fail(new Error(`Invalid version: ${input}`))
+    const data = yield* release("npm")
+    return managedError(installedOwner, `${data.package}@${input?.trim().replace(/^v/, "") ?? data.version}`)
+  })
 
   const temporaryDirectory = (prefix: string) =>
     Effect.acquireRelease(fs.makeTempDirectory({ directory: global.cache, prefix }), (directory) =>
@@ -323,7 +434,12 @@ const make = Effect.gen(function* () {
   const retaining = <A, E, R>(method: Method, effect: Effect.Effect<A, E, R>, directory = global.cache) => {
     if (process.platform !== "win32" || method === "brew") return effect
     // Only the installed binary is at stake; source checkouts run inside bun or node.
-    const owned = method === "curl" ? path.resolve(process.execPath) === curlBinary : installedPackage !== undefined
+    const owned =
+      method === "curl"
+        ? executable === curlBinary
+        : method === "winget"
+          ? installedWinget
+          : installedPackage !== undefined
     if (!owned) return effect
     return Effect.scoped(RetainedImage.retain(directory, "upgrade").pipe(Effect.andThen(effect))).pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
@@ -368,17 +484,23 @@ const make = Effect.gen(function* () {
     if (!parseReleaseVersion(input)) return yield* Effect.fail(new Error(`Invalid version: ${input}`))
     const version = input.trim().replace(/^v/, "")
     const packageName =
-      method === "brew" && installedFormula === "opencode" ? "opencode" : (yield* release(method)).package
+      method === "winget"
+        ? wingetPackage
+        : method === "brew" && installedFormula === "opencode"
+          ? "opencode"
+          : (yield* release(method)).package
     const target = `${packageName}@${version}`
     if (installedPackage && packageName !== installedPackage && (method === "pnpm" || method === "yarn")) {
       return yield* Effect.fail(new Error(`Reinstall ${target} with ${method} to migrate from ${installedPackage}.`))
     }
-    const commands: Record<Exclude<Method, "bun" | "curl" | "brew">, string[]> = {
+    const commands: Record<Exclude<Method, "bun" | "curl" | "brew" | "winget">, string[]> = {
       // Keep the old package: uninstalling it can unlink the replacement command.
       npm: [
-        "npm",
+        npm,
         "install",
         "--global",
+        ...npmPrefixArgs,
+        `--allow-scripts=${packageName}`,
         ...((OPENCODE_ARTIFACT === "cli" && !installedPackage?.endsWith("/cli-node")) ||
         (installedPackage && packageName !== installedPackage)
           ? ["--force"]
@@ -433,6 +555,22 @@ const make = Effect.gen(function* () {
           )
         }
         if (method === "brew") return yield* runUpgrade({ method, command: ["brew", "upgrade", packageName] })
+        if (method === "winget")
+          return yield* retaining(
+            method,
+            runUpgrade({
+              method,
+              command: [
+                "winget",
+                "upgrade",
+                ...wingetArgs,
+                "--version",
+                version,
+                "--silent",
+                "--accept-package-agreements",
+              ],
+            }),
+          )
         return yield* retaining(method, runUpgrade({ method, command: commands[method] }))
       }),
     ).pipe(
@@ -448,8 +586,22 @@ const make = Effect.gen(function* () {
               { cause },
             ),
       ),
-      Effect.asVoid,
     )
+    // A package manager can succeed while updating a different copy, for example another prefix. pnpm keeps each
+    // version in its own store directory, so the running copy never changes there.
+    if (installedPackage !== packageName || !(method === "npm" || method === "bun" || method === "yarn")) return
+    const installed = yield* fs.readFileString(path.join(packageDirectory, "package.json")).pipe(
+      Effect.map((text) => Option.getOrUndefined(decodeManifestVersion(text))?.version),
+      Effect.orElseSucceed(() => undefined),
+    )
+    if (installed !== version)
+      return yield* Effect.fail(
+        new UpgradeError({
+          title: `${installNames[method]} did not update this copy of OpenCode`,
+          detail: `${installNames[method]} reported success, but ${executable} is still version ${installed ?? "unknown"}.`,
+          retry: `Update the copy at ${executable} with the package manager that installed it, then run opencode upgrade again.`,
+        }),
+      )
   })
 
   const inspect = Effect.fnUntraced(function* () {
@@ -496,7 +648,15 @@ const make = Effect.gen(function* () {
   })
 
   const apply = Effect.fn("cli.updater.apply")(function* (version: string) {
-    if (!(yield* install(version))) return yield* Effect.fail(new Error("Installation method not found"))
+    if (yield* install(version)) return
+    const error = yield* managed(version)
+    return yield* Effect.fail(
+      new Error(
+        error
+          ? managedMessage(error)
+          : "Could not detect the installation method. Update with your package manager or download the latest release.",
+      ),
+    )
   })
 
   const check = Effect.fn("cli.updater.check")(function* () {
@@ -505,7 +665,22 @@ const make = Effect.gen(function* () {
         type: "unavailable" as const,
         message: "This build runs from a source checkout. Use an installed OpenCode release to check for updates.",
       }
-    const version = yield* latest()
+    const detected = yield* method()
+    if (!detected && installedOwner) {
+      const data = yield* release("npm")
+      if (action(OPENCODE_VERSION, data.version, "auto") === "none") return undefined
+      return {
+        type: "unavailable" as const,
+        message: managedMessage(managedError(installedOwner, `${data.package}@${data.version}`)),
+      }
+    }
+    if (!detected)
+      return {
+        type: "unavailable" as const,
+        message:
+          "Could not detect the installation method. Update with your package manager or download the latest release.",
+      }
+    const version = yield* latest(detected)
     if (!parseReleaseVersion(version)) return yield* Effect.fail(new Error(`Invalid version: ${version}`))
     const current = yield* Ref.get(installedVersion)
     if (action(current, version, "auto") === "none") {
@@ -529,7 +704,7 @@ const make = Effect.gen(function* () {
     Effect.catch((error) => Effect.logWarning("update check failed", { error }).pipe(Effect.as(undefined))),
   )
 
-  return Service.of({ run, check, apply, method, latest, upgrade, removal })
+  return Service.of({ run, check, apply, method, managed, latest, upgrade, removal })
 })
 
 export const layer = Layer.effect(Service, make)
